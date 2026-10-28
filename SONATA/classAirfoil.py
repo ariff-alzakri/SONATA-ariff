@@ -98,7 +98,7 @@ class Airfoil(object):
         the class attributes
         """
         self.name = yml["name"]
-        self.relative_thickness = yml.get("relative_thickness")
+        self.relative_thickness = yml.get("rthick")
 
         self.coordinates = np.asarray([yml["coordinates"]["x"], yml["coordinates"]["y"]], dtype=float).T
         # Shifting coordinates such that the y values of the first and last coordinate average to 0

@@ -45,6 +45,125 @@ def arc_length(x, y):
 
     return arc
 
+
+def _find_anchor(structure, name):
+    """ Returns the anchor `name` from the anchors of the structure (or None) """
+    for anchor in structure.get('anchors', []):
+        if anchor['name'] == name:
+            return anchor
+    return None
+
+
+def _web_arc(structure, web, handle):
+    """
+    Returns the grid/values definition of the start or end (`handle`) of a
+    shear web, following the anchor references of windIO v2. The arcs of the
+    webs are taken as written in the anchors (WISDEM writes the result of the
+    plane intersection there).
+    """
+    ref = web[handle]
+    for _ in range(20):
+        if 'grid' in ref and 'values' in ref:
+            return ref
+        name = ref['anchor']['name']
+        anchor = _find_anchor(structure, name)
+        if anchor is None or ref['anchor']['handle'] not in anchor:
+            raise ValueError("Web %s: %s anchor %s.%s has no arc defined"
+                             % (web['name'], handle, name, ref['anchor']['handle']))
+        ref = anchor[ref['anchor']['handle']]
+    raise ValueError("Web %s: circular anchor references for %s" % (web['name'], handle))
+
+
+def _is_placeholder(arc, handle):
+    """
+    True if the grid/values `arc` only places the handle at the trailing edge
+    (0 for start_nd_arc, 1 for end_nd_arc). The windIO converter and WISDEM
+    write such placeholders for arcs that are defined by a width or offset.
+    """
+    if 'grid' not in arc or 'values' not in arc:
+        return False
+    te = 0. if handle == 'start_nd_arc' else 1.
+    return bool(np.all(np.asarray(arc['values'], dtype=float) == te))
+
+
+def _resolve_arc(structure, ref, x, profile_curve, id_le, total_arc, ch, depth=0):
+    """
+    Non dimensional arc position at the span position x of a windIO v2 arc
+    definition, which is either a grid/values pair or a reference to an
+    anchor: {'anchor': {'name': ..., 'handle': ...}}
+
+    Precedence for an anchor:
+        1. The anchors TE (0 at start_nd_arc, 1 at end_nd_arc) and LE
+            (from the airfoil profile) are fixed.
+        2. The grid/values or the anchor reference given for the handle,
+            unless the handle is defined by `width` or `offset_(nd_)arc` and
+            the grid/values are only a placeholder at the trailing edge.
+            The arcs written by WISDEM are used as they are.
+        3. `width`, if it `defines` the handle, from the other end of the
+            anchor or from its `midpoint_nd_arc`.
+        4. `offset_nd_arc` or `offset_arc`, if they define the handle.
+
+    A `plane_intersection` is not computed here; its result needs to be
+    written in the anchor (as done by WISDEM).
+    """
+    if depth > 20:
+        raise ValueError("Circular anchor references in the blade structure")
+
+    if 'grid' in ref and 'values' in ref:
+        return float(PchipInterpolator(ref['grid'], ref['values'])(x))
+
+    name = ref['anchor']['name']
+    handle = ref['anchor']['handle']
+
+    if name == 'TE':
+        return 0. if handle == 'start_nd_arc' else 1.
+    if name == 'LE':
+        return float(profile_curve[id_le])
+
+    anchor = _find_anchor(structure, name)
+    if anchor is None:
+        raise ValueError("Anchor %s not found in the anchors of the blade structure" % name)
+
+    def resolve(sub_ref):
+        return _resolve_arc(structure, sub_ref, x, profile_curve, id_le, total_arc, ch, depth + 1)
+
+    width = anchor.get('width')
+    width_defines = width is not None and handle in width.get('defines', [])
+    offsets = [(key, anchor[key]) for key in ['offset_nd_arc', 'offset_arc']
+               if key in anchor and anchor[key].get('defines') == handle]
+
+    if handle in anchor and not ((width_defines or offsets) and _is_placeholder(anchor[handle], handle)):
+        return resolve(anchor[handle])
+
+    if width_defines:
+        width_nd = float(PchipInterpolator(width['grid'], width['values'])(x)) / total_arc / ch
+        if len(width['defines']) == 1:
+            if handle == 'start_nd_arc':
+                start = resolve(anchor['end_nd_arc']) - width_nd
+                # Wrap value if less than 0.0
+                return start + (start < 0)
+            end = resolve(anchor['start_nd_arc']) + width_nd
+            # Reduce the value if greater than 1.0
+            return end - (end > 1.0)
+        midpoint = anchor.get('midpoint_nd_arc')
+        if midpoint is not None and ('grid' in midpoint or 'anchor' in midpoint):
+            mid_nd = resolve(midpoint)
+            if handle == 'start_nd_arc':
+                start = mid_nd - 0.5 * width_nd
+                return start + (start < 0)
+            end = mid_nd + 0.5 * width_nd
+            return end - (end > 1.0)
+
+    for key, offset in offsets:
+        offset_i = float(PchipInterpolator(offset['grid'], offset['values'])(x))
+        if key == 'offset_arc':
+            offset_i = offset_i / total_arc / ch
+        return resolve({'anchor': offset['anchor']}) + offset_i
+
+    raise ValueError("Anchor %s has no %s that SONATA can evaluate (plane intersections "
+                     "need to be written as grid/values, e.g. by WISDEM)" % (name, handle))
+
+
 def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
     """
     Converts the
@@ -56,7 +175,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
         from classBlade
 
     byml : dict
-        yaml data of the blade
+        yaml data of the blade (windIO v2)
 
     materials :
 
@@ -69,20 +188,9 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
     Notes
     -----
 
-    Precedence of keys:
-        1. `start_nd_arc` and `end_nd_arc` will be used as
-            provided if provided.
-        2. If `width` is provided with one of `start_nd_arc` or `end_nd_arc`,
-            then the `width` will be used to set the other value.
-        3. If `width` is defined with neither `start_nd_arc` or `end_nd_arc`,
-            and `midpoint_nd_arc` is provided, then those two values will be
-            used.
-        4. Other cases are not implemented so will use the default values
-            for `start_nd_arc` (0) and `end_nd_arc` (1).
-
-    `midpoint_nd_arc` can be defined with values on a grid or with
-    `fixed : LE` or `fixed : TE` for the leading and trailing edges
-    respectively.
+    The `start_nd_arc` and `end_nd_arc` of the layers are evaluated from the
+    anchors of `structure` (see `_resolve_arc` for the precedence of keys).
+    Fiber orientations are given in deg.
 
     At all stations, shear webs are sorted into a list by
     ['start_nd_arc']['values'][0]. Material cannot be placed on the second
@@ -92,16 +200,48 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
     Layers around the shear web have a default flange of 0.01
     normalized arc length that is hard coded here.
+
+    Cavity filler (extension, not part of windIO):
+    the open cavities of the cross section (the cells in front of, between
+    and behind the shear webs, or the whole interior where no web exists)
+    are filled with a material if `structure` contains
+
+        cavity_filler:
+            material: <name of a material in the materials list>
+            span: [0.0, 1.0]   # optional, non-dimensional span range
+
+    Shear web cores and the trailing edge adhesive are not affected.
     """
 
-    # Segments and webs
-    unordered_webs        = byml.get('internal_structure_2d_fem').get('webs')
+    structure = byml.get('structure')
+    mat_names = [materials[mat].name for mat in materials]
+
+    # Optional filler for the open cavities of the cross section
+    cavity_filler = structure.get('cavity_filler')
+    if cavity_filler:
+        fill_mat = cavity_filler.get('material')
+        if fill_mat not in mat_names:
+            raise ValueError("cavity_filler material '%s' is not in the materials list %s"
+                             % (fill_mat, mat_names))
+        fill_span = cavity_filler.get('span', [0., 1.])
+
+    # Material of the trailing edge adhesive
+    adhesive_mat = structure.get('trailing_edge_adhesive', {}).get('material')
+    if adhesive_mat is None:
+        adhesive_mat = next((name for name in mat_names if name.upper() == 'ADHESIVE'), None)
+
+    # Segments and webs, with the start and end arcs of the webs taken from the anchors
+    unordered_webs = []
+    for web in structure.get('webs', []):
+        tmp_web = {'name': web['name'],
+                   'start_nd_arc': _web_arc(structure, web, 'start_nd_arc'),
+                   'end_nd_arc': _web_arc(structure, web, 'end_nd_arc')}
+        if 'curvature' in web:
+            tmp_web['curvature'] = web['curvature']
+        unordered_webs.append(tmp_web)
     x           = cs_pos # Non dimensional span position of the stations
 
-    if unordered_webs is None:
-        n_webs = 0
-    else:
-        n_webs  = len(unordered_webs) # Max number of webs along span
+    n_webs  = len(unordered_webs) # Max number of webs along span
     web_exist  = np.zeros((len(x), n_webs), dtype=int) # Flag to set whether webs have non zero thickness, initialized at 0
 
     # Webs need to be defined from LE to TE
@@ -114,7 +254,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
     id_webs = [dict() for n in range(len(x))]
 
     # Get sections information and init the CBM instances.
-    tmp1 = byml.get('internal_structure_2d_fem').get('layers')
+    tmp1 = structure.get('layers')
 
     # Set the web_exist flag. This checks whether at every station there is at least a non-zero thickness
     # layer defined in the web. If there isn't, webs are not built even if they are defined in terms of start and end positions
@@ -178,6 +318,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
         if np.mean(profile[0:id_le, 1]) < 0:
             profile = np.flip(profile,0)
+            id_le = np.argmin(profile[:,0])
 
         total_arc = arc_length(profile[:,0], profile[:,1])[-1]
         profile_curve   = arc_length(profile[:,0], profile[:,1]) / total_arc
@@ -192,98 +333,20 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
                 set_interp_thick = PchipInterpolator(sec['thickness']['grid'], sec['thickness']['values'])
                 thick_i = float(set_interp_thick(x[i]))  # added float
 
-                default_start = False
-                default_end = False
+                ch = np.interp(x[i], blade.chord[:,0], blade.chord[:,1])
 
-                if 'start_nd_arc' in sec.keys():
-                    set_interp = PchipInterpolator(sec['start_nd_arc']['grid'], sec['start_nd_arc']['values'])
-                    start_i     = float(set_interp(x[i]))
+                if 'web' in sec.keys():
+                    # The arcs of web layers refer to the web attachment and are not used
+                    start_i = 0.
+                    end_i = 1.
+                else:
+                    start_i = _resolve_arc(structure, sec['start_nd_arc'], x[i], profile_curve, id_le, total_arc, ch)
                     start_i -= 1.0*(start_i >= 1.0)
                     if start_i>0. and start_i<0.1 and id_layer>0:
                         for kk in range(len(tmp2[i]['segments'][0]['layup'])):
                             if abs(start_i - tmp2[i]['segments'][0]['layup'][kk]['end']) < 1.e-5:
                                 start_i += 5.e-3
-                else:
-                    start_i = 0
-                    default_start = True
-                if 'end_nd_arc' in sec.keys():
-                    set_interp = PchipInterpolator(sec['end_nd_arc']['grid'], sec['end_nd_arc']['values'])
-                    end_i     = float(set_interp(x[i]))
-                else:
-                    end_i = 1
-                    default_end = True
-
-                ch = np.interp(x[i], blade.chord[:,0], blade.chord[:,1])
-
-                if 'width' in sec.keys():
-
-                    width_interp = PchipInterpolator(sec['width']['grid'],
-                                                 sec['width']['values'])
-
-                    width_nd = float(width_interp(x[i])) / total_arc / ch
-
-                    if default_start and not default_end:
-
-                        start_i = end_i - width_nd
-
-                        # Wrap value if less than 0.0
-                        start_i += (start_i < 0)
-
-                        default_start = False
-
-                    if default_end and not default_start:
-
-                        end_i = start_i + width_nd
-                        # Reduce the value if greater than 1.0
-                        end_i -= (end_i > 1.0)
-
-                        default_end = False
-
-
-                # If using default for the start and end, then the default
-                # value should be overwritten by the midpoint_nd_arc/width
-                # option set
-                if 'midpoint_nd_arc' in sec.keys() \
-                    and 'width' in sec.keys() \
-                    and default_start and default_end:
-
-                    width_interp = PchipInterpolator(sec['width']['grid'],
-                                                 sec['width']['values'])
-
-                    width_nd = float(width_interp(x[i])) / total_arc / ch
-
-                    if 'fixed' in sec['midpoint_nd_arc'].keys():
-
-                        if sec['midpoint_nd_arc']['fixed'].upper() == 'LE':
-
-                            # profile may have had order flipped after
-                            # previous id_le determination.
-                            id_le = np.argmin(profile[:,0])
-
-                            mid_nd = profile_curve[id_le]
-
-                        elif sec['midpoint_nd_arc']['fixed'].upper() == 'TE':
-
-                            mid_nd = 1.0
-
-                        else:
-                            print("WARNING : Unrecognized keyword for "
-                                  + "['midpoint_nd_arc']['fixed']!")
-                            mid_nd = np.nan
-
-                    else:
-                        mid_interp = PchipInterpolator(sec['midpoint_nd_arc']['grid'],
-                                                     sec['midpoint_nd_arc']['values'])
-
-                        mid_nd = float(mid_interp(x[i]))
-
-                    start_i = mid_nd - 0.5*width_nd
-                    # Wrap value if less than 0.0
-                    start_i += (start_i < 0)
-
-                    end_i = mid_nd + 0.5*width_nd
-                    # Reduce the value if greater than 1.0
-                    end_i -= (end_i > 1.0)
+                    end_i = _resolve_arc(structure, sec['end_nd_arc'], x[i], profile_curve, id_le, total_arc, ch)
 
                 if thick_i > 1.e-6 and abs(start_i - end_i) > 1.e-3:
                     if 'web' not in sec.keys():
@@ -300,7 +363,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
                         if 'fiber_orientation' in sec.keys():
                             set_interp = PchipInterpolator(sec['fiber_orientation']['grid'], sec['fiber_orientation']['values'])
-                            tmp2[i]['segments'][0]['layup'][id_layer]['orientation'] = float(set_interp(x[i]) * 180 / np.pi)  # added float
+                            tmp2[i]['segments'][0]['layup'][id_layer]['orientation'] = float(set_interp(x[i]))  # added float
                         else:
                             tmp2[i]['segments'][0]['layup'][id_layer]['orientation'] = 0.
 
@@ -345,7 +408,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
                                     if 'fiber_orientation' in sec.keys():
                                         set_interp = PchipInterpolator(sec['fiber_orientation']['grid'], sec['fiber_orientation']['values'])
-                                        tmp2[i]['segments'][id_seg - 1]['layup'][id_layer_web_le[i]]['orientation'] = float(set_interp(x[i]) * 180 / np.pi)
+                                        tmp2[i]['segments'][id_seg - 1]['layup'][id_layer_web_le[i]]['orientation'] = float(set_interp(x[i]))
                                     else:
                                         tmp2[i]['segments'][id_seg - 1]['layup'][id_layer_web_le[i]]['orientation'] = 0.
 
@@ -412,7 +475,7 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
                                     if 'fiber_orientation' in sec.keys():
                                         set_interp = PchipInterpolator(sec['fiber_orientation']['grid'],sec['fiber_orientation']['values'])
-                                        tmp2[i]['segments'][id_seg + 1]['layup'][id_layer_web_te[i]]['orientation'] = float(set_interp(x[i]) * 180 / np.pi)
+                                        tmp2[i]['segments'][id_seg + 1]['layup'][id_layer_web_te[i]]['orientation'] = float(set_interp(x[i]))
                                     else:
                                         tmp2[i]['segments'][id_seg + 1]['layup'][id_layer_web_te[i]]['orientation'] = 0.
 
@@ -420,16 +483,38 @@ def converter_WT(blade, cs_pos, byml, materials, mesh_resolution):
 
         if x[i] > span_adhesive and len(tmp2[i]['segments']) > 1:
             # id_seg = n_webs*2 + 2
-            assert 'ADHESIVE' in [materials[mat].name.upper() for mat in materials], \
+            assert adhesive_mat in mat_names, \
                 'Adhesive material needs to be included for TE fill.'
 
-            tmp2[i]['segments'][-1]['filler'] = 'Adhesive'
+            tmp2[i]['segments'][-1]['filler'] = adhesive_mat
             tmp2[i]['segments'][-1]['layup'][0]['name'] = 'dummy'
-            tmp2[i]['segments'][-1]['layup'][0]['material_name'] = 'Adhesive'
+            tmp2[i]['segments'][-1]['layup'][0]['material_name'] = adhesive_mat
             tmp2[i]['segments'][-1]['layup'][0]['thickness'] = 5.e-4
             tmp2[i]['segments'][-1]['layup'][0]['start'] = 0.0
             tmp2[i]['segments'][-1]['layup'][0]['end'] = 1.0
             tmp2[i]['segments'][-1]['layup'][0]['orientation'] = 0.0
+
+        # Fill the open cavities. Segment 0 is the shell; with webs the odd
+        # segments (1, 3, ...) are the cavities, the even ones are the web
+        # cores and, outboard of span_adhesive, the trailing edge adhesive.
+        if cavity_filler and fill_span[0] <= x[i] <= fill_span[1]:
+            if len(tmp2[i]['segments']) == 1:
+                # No webs at this station: the core of segment 0 is the whole interior
+                tmp2[i]['segments'][0]['filler'] = fill_mat
+            else:
+                for seg in tmp2[i]['segments'][1::2]:
+                    if seg['filler'] is None:
+                        seg['filler'] = fill_mat
+                        # As for the web cores and the adhesive, a thin layer of the
+                        # filler material closes the boundary of the segment, so that
+                        # the core mesh finds nodes all around it (also on the webs).
+                        dummy = {'name': 'dummy', 'material_name': fill_mat,
+                                 'thickness': 5.e-4, 'start': 0.0, 'end': 1.0,
+                                 'orientation': 0.0}
+                        if seg['layup'] == [{}]:
+                            seg['layup'][0] = dummy
+                        else:
+                            seg['layup'].append(dummy)
 
 
     # Split webs for determining the

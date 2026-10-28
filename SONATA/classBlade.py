@@ -255,6 +255,13 @@ class Blade(Component):
                 yml = yaml.load(inputs, Loader = yaml.FullLoader)
                 self.yml = yml
 
+            # SONATA reads the windIO v2 format, as used by WISDEM
+            byml = yml.get('components').get('blade')
+            if 'outer_shape_bem' in byml or 'outer_shape' not in byml:
+                raise ValueError("%s is not a windIO v2 file (found 'outer_shape_bem' instead of 'outer_shape'). "
+                                 "Convert it with the converter of the windIO package: "
+                                 "python <site-packages>/windIO/converters/windIO2windIO.py -i old.yaml -o new.yaml"
+                                 % filename)
 
             airfoils = [Airfoil(af) for af in yml.get('airfoils')]
             self.materials = read_materials(yml.get('materials'))
@@ -469,18 +476,22 @@ class Blade(Component):
         print('STATUS:\t Reading YAML Dictionary for Beam/Blade: %s' % (self.name))
         c2_axis = kwargs.get('flags',{}).get('c2_axis')
         #Read chord, twist and nondim. pitch axis location and create interpolation
-        tmp_chord = np.asarray((yml.get('outer_shape_bem').get('chord').get('grid'),yml.get('outer_shape_bem').get('chord').get('values'))).T
-        tmp_tw = np.asarray((yml.get('outer_shape_bem').get('twist').get('grid'),yml.get('outer_shape_bem').get('twist').get('values'))).T
-        tmp_pa = np.asarray((yml.get('outer_shape_bem').get('pitch_axis').get('grid'),yml.get('outer_shape_bem').get('pitch_axis').get('values'))).T
+        # windIO v2: twist is given in deg, the pitch axis as dimensional
+        # section_offset_y from the leading edge
+        outer_shape = yml.get('outer_shape')
+        tmp_chord = np.asarray((outer_shape.get('chord').get('grid'),outer_shape.get('chord').get('values'))).T
+        tmp_tw = np.asarray((outer_shape.get('twist').get('grid'),np.deg2rad(outer_shape.get('twist').get('values')))).T
+        offset_y = np.asarray((outer_shape.get('section_offset_y').get('grid'),outer_shape.get('section_offset_y').get('values'))).T
+        tmp_pa = np.vstack((offset_y[:,0], offset_y[:,1] / np.interp(offset_y[:,0], tmp_chord[:,0], tmp_chord[:,1]))).T
 
         #Read blade & beam reference axis and create BSplineLst & interpolation instance
-        (self.blade_ref_axis_BSplineLst, self.f_blade_ref_axis, tmp_blra) = self._read_ref_axes(yml.get('outer_shape_bem').get('reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'), c2_axis=c2_axis, tmp_chord = tmp_chord, tmp_pa = tmp_pa, tmp_tw=tmp_tw)
+        (self.blade_ref_axis_BSplineLst, self.f_blade_ref_axis, tmp_blra) = self._read_ref_axes(yml.get('reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'), c2_axis=c2_axis, tmp_chord = tmp_chord, tmp_pa = tmp_pa, tmp_tw=tmp_tw)
 
-        if not yml.get('outer_shape_bem').get('beam_reference_axis'):
+        if not yml.get('beam_reference_axis'):
             #  In case beam reference axis is not defined in yaml file, use identical coordinates for beam reference and reference axis
-            (self.beam_ref_axis_BSplineLst, self.f_beam_ref_axis, tmp_bera) = self._read_ref_axes(yml.get('outer_shape_bem').get('reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'), c2_axis=c2_axis, tmp_chord = tmp_chord, tmp_pa = tmp_pa, tmp_tw=tmp_tw)
+            (self.beam_ref_axis_BSplineLst, self.f_beam_ref_axis, tmp_bera) = self._read_ref_axes(yml.get('reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'), c2_axis=c2_axis, tmp_chord = tmp_chord, tmp_pa = tmp_pa, tmp_tw=tmp_tw)
         else:
-            (self.beam_ref_axis_BSplineLst, self.f_beam_ref_axis, tmp_bera) = self._read_ref_axes(yml.get('outer_shape_bem').get('beam_reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'))
+            (self.beam_ref_axis_BSplineLst, self.f_beam_ref_axis, tmp_bera) = self._read_ref_axes(yml.get('beam_reference_axis'), flag_ref_axes_wt=kwargs.get('flags', {}).get('flag_ref_axes_wt'))
 
         if c2_axis:
             tmp_pa[:,1]=0.5
@@ -489,7 +500,8 @@ class Blade(Component):
         self.f_pa = interp1d(tmp_pa[:,0], tmp_pa[:,1], bounds_error=False, fill_value='extrapolate')
 
         #Read airfoil information
-        airfoil_position = (yml.get('outer_shape_bem').get('airfoil_position').get('grid'),yml.get('outer_shape_bem').get('airfoil_position').get('labels'))
+        airfoil_position = ([af.get('spanwise_position') for af in outer_shape.get('airfoils')],
+                            [af.get('name') for af in outer_shape.get('airfoils')])
         tmp = []
         for an in airfoil_position[1]:
             tmp.append(next((x for x in airfoils if x.name == an), None).id)
@@ -503,7 +515,7 @@ class Blade(Component):
                 cs_pos = np.linspace(0.0, 1.0, npts)
         else:
             if stations is None:
-                cs_pos = np.asarray([cs.get('position') for cs in yml.get('internal_structure_2d_fem').get('sections')])
+                cs_pos = np.asarray([cs.get('position') for cs in yml.get('structure').get('sections')])
             else:
                 cs_pos = stations
 
@@ -526,7 +538,7 @@ class Blade(Component):
             cbmconfigs = converter_WT(self, cs_pos, yml, self.materials, mesh_resolution = kwargs.get('flags').get('mesh_resolution'))
 
         else:
-            lst = [[cs.get("position"), CBMConfig(cs, self.materials)] for cs in yml.get("internal_structure_2d_fem").get("sections")]
+            lst = [[cs.get("position"), CBMConfig(cs, self.materials)] for cs in yml.get("structure").get("sections")]
             cbmconfigs = np.asarray(lst)
 
 

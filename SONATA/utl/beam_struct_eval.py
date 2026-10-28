@@ -585,7 +585,7 @@ def strain_energy_eval(blade, MatID=None, station_weights=None):
 
     """
 
-    length = blade.yml['components']['blade']['outer_shape_bem'] \
+    length = blade.yml['components']['blade'] \
                     ['reference_axis']['z']['values'][-1]
 
     # Energy calculated in material coordinates.

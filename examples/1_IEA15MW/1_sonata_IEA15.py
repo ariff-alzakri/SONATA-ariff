@@ -71,7 +71,7 @@ job.blade_gen_section(topo_flag=True, mesh_flag = True)
 # ===== Recovery Analysis + BeamDyn Outputs ===== #
 
 # Define flags
-flag_3d = False 
+flag_3d = True 
 flag_csv_export = False                         # export csv files with structural data
 # Update flags dictionary
 flags_dict['flag_csv_export'] = flag_csv_export
@@ -98,11 +98,11 @@ beam_struct_eval(flags_dict, Loads_dict, radial_stations, job, run_dir, job_str,
 # job.blade_plot_sections(attribute=attribute_str, plotTheta11=flag_plotTheta11, plotDisplacement=flag_plotDisplacement, savepath=run_dir)
 
 
-# if flag_3d:
-#     job.blade_post_3dtopo(flag_wf=flags_dict['flag_wf'], flag_lft=flags_dict['flag_lft'], flag_topo=flags_dict['flag_topo'])
+if flag_3d:
+    job.blade_post_3dtopo(flag_wf=flags_dict['flag_wf'], flag_lft=flags_dict['flag_lft'], flag_topo=flags_dict['flag_topo'])
 
-# Use the improved continuous method (recommended)
-from export_util import blade_export_step   
-print("Exporting STEP file using continuous method...")
-dir_path = os.path.dirname( os.path.realpath(__file__) )
-blade_export_step(blade_object = job, output_name=os.path.join(dir_path,"my_blade.stp"), method="continuous")
+# # Use the improved continuous method (recommended)
+# from export_util import blade_export_step   
+# print("Exporting STEP file using continuous method...")
+# dir_path = os.path.dirname( os.path.realpath(__file__) )
+# blade_export_step(blade_object = job, output_name=os.path.join(dir_path,"my_blade.stp"), method="continuous")
